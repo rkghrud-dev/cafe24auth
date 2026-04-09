@@ -42,13 +42,16 @@ namespace Cafe24Auth
         // ──────────────── DTO ────────────────
         private class Cafe24Token
         {
-            public string   access_token  { get; set; } = "";
-            public string   refresh_token { get; set; } = "";
-            public string   token_type    { get; set; } = "";
-            public int      expires_in    { get; set; }
-            public string   scope         { get; set; } = "";
-            public DateTime issued_at     { get; set; }
-            public string   mall_id       { get; set; } = "";
+            public string   MallId        { get; set; } = "";
+            public string   ClientId      { get; set; } = "";
+            public string   ClientSecret  { get; set; } = "";
+            public string   AccessToken   { get; set; } = "";
+            public string   RefreshToken  { get; set; } = "";
+            public string   RedirectUri   { get; set; } = "";
+            public string   ApiVersion    { get; set; } = "2025-12-01";
+            public string   ShopNo        { get; set; } = "1";
+            public string   Scope         { get; set; } = "";
+            public DateTime UpdatedAt     { get; set; }
         }
 
         private class AppSettings
@@ -462,11 +465,11 @@ namespace Cafe24Auth
         {
             if (InvokeRequired) { Invoke(() => DisplayToken(token)); return; }
 
-            txtAccessToken.Text  = token.access_token;
-            txtRefreshToken.Text = token.refresh_token;
-            txtScope.Text        = token.scope;
+            txtAccessToken.Text  = token.AccessToken;
+            txtRefreshToken.Text = token.RefreshToken;
+            txtScope.Text        = token.Scope;
 
-            var expiry = token.issued_at.AddSeconds(token.expires_in);
+            var expiry = token.UpdatedAt.AddSeconds(7200);
             txtExpiry.Text = $"만료: {expiry:yyyy-MM-dd HH:mm:ss}";
 
             if (DateTime.Now > expiry)
@@ -484,7 +487,7 @@ namespace Cafe24Auth
 
         private void SaveToken(Cafe24Token token)
         {
-            string path = TokenPath(token.mall_id);
+            string path = TokenPath(token.MallId);
             Directory.CreateDirectory(KEY_DIR);
             File.WriteAllText(path, JsonSerializer.Serialize(token, new JsonSerializerOptions { WriteIndented = true }));
             Log($"토큰 저장 → {Path.GetFileName(path)}");
@@ -629,7 +632,7 @@ namespace Cafe24Auth
                 }
 
                 Log("인증 코드 수신 완료. 토큰 교환 중...");
-                await ExchangeCodeForToken(mallId, clientId, clientSecret, code, redirectUri);
+                await ExchangeCodeForToken(mallId, clientId, clientSecret, code, redirectUri, scope);
             }
             catch (TaskCanceledException)
             {
@@ -649,7 +652,7 @@ namespace Cafe24Auth
             }
         }
 
-        private async Task ExchangeCodeForToken(string mallId, string clientId, string clientSecret, string code, string redirectUri)
+        private async Task ExchangeCodeForToken(string mallId, string clientId, string clientSecret, string code, string redirectUri, string scope)
         {
             string tokenUrl    = $"https://{mallId}.cafe24api.com/api/v2/oauth/token";
             string credentials = Convert.ToBase64String(Encoding.ASCII.GetBytes($"{clientId}:{clientSecret}"));
@@ -677,7 +680,7 @@ namespace Cafe24Auth
                     return;
                 }
 
-                var token = ParseToken(body, mallId);
+                var token = ParseToken(body, mallId, clientId, clientSecret, redirectUri, scope);
                 SaveToken(token);
                 DisplayToken(token);
                 Log($"✅ 토큰 발급 완료! → cafe24_token_{mallId}.json", Color.Cyan);
@@ -714,18 +717,18 @@ namespace Cafe24Auth
             try
             {
                 var t = JsonSerializer.Deserialize<Cafe24Token>(File.ReadAllText(path))!;
-                if (string.IsNullOrEmpty(t.refresh_token))
+                if (string.IsNullOrEmpty(t.RefreshToken))
                 {
                     Log("Refresh Token이 없습니다. 다시 OAuth 인증을 진행하세요.", Color.Red);
                     return;
                 }
 
-                string resolvedMallId = string.IsNullOrEmpty(t.mall_id) ? mallId : t.mall_id;
-                string clientId       = txtClientId.Text.Trim();
-                string clientSecret   = txtClientSecret.Text.Trim();
+                string resolvedMallId = string.IsNullOrEmpty(t.MallId) ? mallId : t.MallId;
+                string clientId       = string.IsNullOrEmpty(t.ClientId)     ? txtClientId.Text.Trim()     : t.ClientId;
+                string clientSecret   = string.IsNullOrEmpty(t.ClientSecret) ? txtClientSecret.Text.Trim() : t.ClientSecret;
 
                 Log("Refresh Token으로 갱신 중...");
-                await RefreshAccessToken(resolvedMallId, clientId, clientSecret, t.refresh_token);
+                await RefreshAccessToken(resolvedMallId, clientId, clientSecret, t.RefreshToken, t);
             }
             catch (Exception ex)
             {
@@ -738,7 +741,7 @@ namespace Cafe24Auth
             }
         }
 
-        private async Task RefreshAccessToken(string mallId, string clientId, string clientSecret, string refreshToken)
+        private async Task RefreshAccessToken(string mallId, string clientId, string clientSecret, string refreshToken, Cafe24Token existing)
         {
             string tokenUrl    = $"https://{mallId}.cafe24api.com/api/v2/oauth/token";
             string credentials = Convert.ToBase64String(Encoding.ASCII.GetBytes($"{clientId}:{clientSecret}"));
@@ -766,9 +769,9 @@ namespace Cafe24Auth
                     return;
                 }
 
-                var token = ParseToken(body, mallId);
-                if (string.IsNullOrEmpty(token.refresh_token))
-                    token.refresh_token = refreshToken;
+                var token = ParseToken(body, mallId, clientId, clientSecret, existing.RedirectUri, existing.Scope);
+                if (string.IsNullOrEmpty(token.RefreshToken))
+                    token.RefreshToken = refreshToken;
 
                 SaveToken(token);
                 DisplayToken(token);
@@ -784,18 +787,23 @@ namespace Cafe24Auth
 
         // ══════════════════════════════════════════
         #region 헬퍼
-        private static Cafe24Token ParseToken(string json, string mallId)
+        private static Cafe24Token ParseToken(string json, string mallId, string clientId, string clientSecret, string redirectUri, string scope)
         {
             var d = JsonSerializer.Deserialize<JsonElement>(json);
+            // API가 scope를 비워서 반환하는 경우 요청 scope 사용
+            string returnedScope = d.TryGetProperty("scope", out var sc) ? sc.GetString() ?? "" : "";
             return new Cafe24Token
             {
-                access_token  = d.TryGetProperty("access_token",  out var at) ? at.GetString() ?? "" : "",
-                refresh_token = d.TryGetProperty("refresh_token", out var rt) ? rt.GetString() ?? "" : "",
-                token_type    = d.TryGetProperty("token_type",    out var tt) ? tt.GetString() ?? "" : "",
-                expires_in    = d.TryGetProperty("expires_in",    out var ei) ? ei.GetInt32()      : 7200,
-                scope         = d.TryGetProperty("scope",         out var sc) ? sc.GetString() ?? "" : "",
-                issued_at     = DateTime.Now,
-                mall_id       = mallId
+                MallId       = mallId,
+                ClientId     = clientId,
+                ClientSecret = clientSecret,
+                AccessToken  = d.TryGetProperty("access_token",  out var at) ? at.GetString() ?? "" : "",
+                RefreshToken = d.TryGetProperty("refresh_token", out var rt) ? rt.GetString() ?? "" : "",
+                RedirectUri  = redirectUri,
+                ApiVersion   = "2025-12-01",
+                ShopNo       = "1",
+                Scope        = string.IsNullOrEmpty(returnedScope) ? scope : returnedScope,
+                UpdatedAt    = DateTime.Now
             };
         }
         #endregion
