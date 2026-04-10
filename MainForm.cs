@@ -28,15 +28,16 @@ namespace Cafe24Auth
         private TextBox txtAuthScope;
         private TextBox txtAccessToken, txtRefreshToken, txtExpiry, txtScope;
         private Button  btnStartAuth, btnRefreshToken, btnLoadToken, btnSaveSettings, btnCopyToken;
-        private Button  btnNgrok, btnNgrokUrl;
-        private Label   lblNgrokStatus;
+        private Button  btnCloudflare;
+        private Label   lblCfStatus;
         private RichTextBox rtbLog;
         private Label   lblStatus;
 
         // ──────────────── 런타임 ────────────────
         private HttpListener?            _httpListener;
         private CancellationTokenSource? _cts;
-        private Process?                 _ngrokProcess;
+        private Process?                 _cfProcess;
+        private string?                  _cfUrl;
         private bool                     _isAuthRunning;
 
         // ──────────────── DTO ────────────────
@@ -93,7 +94,7 @@ namespace Cafe24Auth
             AddRow(grpSettings, ref gy, "Mall ID:",       out txtMallId,       "예: myshop  (myshop.cafe24.com)");
             AddRow(grpSettings, ref gy, "Client ID:",     out txtClientId,     "Cafe24 앱 관리 > Client ID");
             AddRow(grpSettings, ref gy, "Client Secret:", out txtClientSecret, "", password: true);
-            AddRow(grpSettings, ref gy, "Redirect URI:",  out txtRedirectUri,  "https://xxxx.ngrok.io/callback");
+            AddRow(grpSettings, ref gy, "Redirect URI:",  out txtRedirectUri,  "https://xxxx.trycloudflare.com/callback");
             // Scope 행 (버튼 포함)
             grpSettings.Controls.Add(new Label { Text = "API Scope:", Left = 12, Top = gy + 3, AutoSize = true });
             txtAuthScope = new TextBox { Left = 140, Top = gy, Width = 370, PlaceholderText = "아래 '선택' 버튼으로 설정하세요" };
@@ -113,28 +114,24 @@ namespace Cafe24Auth
             txtLocalPort = new TextBox { Left = 140, Top = gy, Width = 70, Text = "5000" };
             grpSettings.Controls.Add(txtLocalPort);
 
-            btnNgrok = MakeButton("▶ ngrok 실행", 220, gy - 1, 120, 28, Color.FromArgb(22, 163, 74));
-            btnNgrok.Click += BtnNgrok_Click;
-            grpSettings.Controls.Add(btnNgrok);
+            btnCloudflare = MakeButton("▶ Cloudflare 실행", 220, gy - 1, 145, 28, Color.FromArgb(22, 163, 74));
+            btnCloudflare.Click += BtnCloudflare_Click;
+            grpSettings.Controls.Add(btnCloudflare);
 
-            btnNgrokUrl = MakeButton("🔗 URL 가져오기", 350, gy - 1, 125, 28, Color.FromArgb(59, 130, 246));
-            btnNgrokUrl.Click += BtnNgrokUrl_Click;
-            grpSettings.Controls.Add(btnNgrokUrl);
-
-            lblNgrokStatus = new Label
+            lblCfStatus = new Label
             {
-                Left = 485, Top = gy + 5, Width = 180, AutoSize = false,
-                Text = "ngrok 미실행", ForeColor = Color.Gray,
+                Left = 375, Top = gy + 5, Width = 290, AutoSize = false,
+                Text = "cloudflared 미실행", ForeColor = Color.Gray,
                 Font = new Font("맑은 고딕", 8.5f)
             };
-            grpSettings.Controls.Add(lblNgrokStatus);
+            grpSettings.Controls.Add(lblCfStatus);
 
             gy += 38;
 
-            // ngrok 안내 라벨
+            // cloudflare 안내 라벨
             var lblNote = new Label
             {
-                Text      = "① ngrok 실행 → ② URL 가져오기 클릭 → Redirect URI 자동입력\n" +
+                Text      = "① Cloudflare 실행 → URL 자동 감지 → Redirect URI 자동입력\n" +
                             "   Cafe24 앱 설정의 Redirect URL과 동일하게 등록하세요.",
                 Left = 12, Top = gy, Width = 650, Height = 36,
                 ForeColor = Color.DimGray, Font = new Font("맑은 고딕", 8.5f)
@@ -267,142 +264,132 @@ namespace Cafe24Auth
             lblStatus.ForeColor = color;
         }
 
-        private void SetNgrokStatus(string text, Color color)
+        private void SetCfStatus(string text, Color color)
         {
-            if (lblNgrokStatus.InvokeRequired) { lblNgrokStatus.Invoke(() => SetNgrokStatus(text, color)); return; }
-            lblNgrokStatus.Text      = text;
-            lblNgrokStatus.ForeColor = color;
+            if (lblCfStatus.InvokeRequired) { lblCfStatus.Invoke(() => SetCfStatus(text, color)); return; }
+            lblCfStatus.Text      = text;
+            lblCfStatus.ForeColor = color;
         }
         #endregion
 
         // ══════════════════════════════════════════
-        #region ngrok
-        private void BtnNgrok_Click(object? sender, EventArgs e)
+        #region Cloudflare Tunnel
+        private void BtnCloudflare_Click(object? sender, EventArgs e)
         {
-            if (_ngrokProcess != null && !_ngrokProcess.HasExited)
+            if (_cfProcess != null && !_cfProcess.HasExited)
             {
                 // 이미 실행 중 → 종료
-                _ngrokProcess.Kill();
-                _ngrokProcess = null;
-                btnNgrok.Text      = "▶ ngrok 실행";
-                btnNgrok.BackColor = Color.FromArgb(22, 163, 74);
-                SetNgrokStatus("ngrok 종료됨", Color.Gray);
-                Log("ngrok 종료");
+                _cfProcess.Kill();
+                _cfProcess = null;
+                _cfUrl = null;
+                btnCloudflare.Text      = "▶ Cloudflare 실행";
+                btnCloudflare.BackColor = Color.FromArgb(22, 163, 74);
+                SetCfStatus("cloudflared 종료됨", Color.Gray);
+                Log("Cloudflare Tunnel 종료");
                 return;
             }
 
             string port = txtLocalPort.Text.Trim();
 
-            // ngrok.exe 위치 탐색: PATH → 현재 폴더 → Desktop
-            string ngrokExe = FindNgrok();
-            if (ngrokExe == null)
+            string? cfExe = FindCloudflared();
+            if (cfExe == null)
             {
                 MessageBox.Show(
-                    "ngrok.exe를 찾을 수 없습니다.\n\n" +
-                    "ngrok을 설치하거나 ngrok.exe를 이 프로그램과 같은 폴더에 두세요.\n" +
-                    "다운로드: https://ngrok.com/download",
-                    "ngrok 없음", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    "cloudflared.exe를 찾을 수 없습니다.\n\n" +
+                    "아래 방법 중 하나로 설치하세요:\n" +
+                    "  • winget install Cloudflare.cloudflared\n" +
+                    "  • 또는 cloudflared.exe를 이 프로그램과 같은 폴더에 두세요.\n" +
+                    "  다운로드: https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/",
+                    "cloudflared 없음", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                 return;
             }
 
             try
             {
-                _ngrokProcess = new Process
+                _cfProcess = new Process
                 {
                     StartInfo = new ProcessStartInfo
                     {
-                        FileName        = ngrokExe,
-                        Arguments       = $"http {port}",
-                        UseShellExecute = false,
-                        CreateNoWindow  = true
+                        FileName               = cfExe,
+                        Arguments              = $"tunnel --url http://localhost:{port}",
+                        UseShellExecute        = false,
+                        CreateNoWindow         = true,
+                        RedirectStandardOutput = true,
+                        RedirectStandardError  = true
                     },
                     EnableRaisingEvents = true
                 };
-                _ngrokProcess.Exited += (s, ev) =>
+
+                // cloudflared는 URL을 stderr에 출력
+                _cfProcess.ErrorDataReceived += (s, ev) =>
+                {
+                    if (string.IsNullOrEmpty(ev.Data)) return;
+                    // URL 패턴 탐지: https://xxxx.trycloudflare.com
+                    var match = System.Text.RegularExpressions.Regex.Match(
+                        ev.Data, @"https://[a-z0-9\-]+\.trycloudflare\.com");
+                    if (match.Success && _cfUrl == null)
+                    {
+                        _cfUrl = match.Value;
+                        this.Invoke(() =>
+                        {
+                            string redirectUri = _cfUrl.TrimEnd('/') + "/callback";
+                            txtRedirectUri.Text = redirectUri;
+                            SetCfStatus("연결됨 ✓", Color.DarkGreen);
+                            Log($"Cloudflare URL: {redirectUri}", Color.Cyan);
+                            Log("Redirect URI가 자동 입력되었습니다. Cafe24 앱 설정과 동일한지 확인하세요.", Color.Yellow);
+                        });
+                    }
+                };
+                _cfProcess.OutputDataReceived += (s, ev) => { /* 무시 */ };
+                _cfProcess.Exited += (s, ev) =>
                 {
                     this.Invoke(() =>
                     {
-                        btnNgrok.Text      = "▶ ngrok 실행";
-                        btnNgrok.BackColor = Color.FromArgb(22, 163, 74);
-                        SetNgrokStatus("ngrok 종료됨", Color.Gray);
+                        btnCloudflare.Text      = "▶ Cloudflare 실행";
+                        btnCloudflare.BackColor = Color.FromArgb(22, 163, 74);
+                        SetCfStatus("cloudflared 종료됨", Color.Gray);
+                        _cfUrl = null;
                     });
                 };
-                _ngrokProcess.Start();
 
-                btnNgrok.Text      = "■ ngrok 중지";
-                btnNgrok.BackColor = Color.FromArgb(220, 38, 38);
-                SetNgrokStatus("시작 중...", Color.Orange);
-                Log($"ngrok 시작: http {port}");
+                _cfProcess.Start();
+                _cfProcess.BeginErrorReadLine();
+                _cfProcess.BeginOutputReadLine();
 
-                // 2초 후 URL 자동 가져오기
-                Task.Delay(2000).ContinueWith(_ => this.Invoke(async () => await FetchNgrokUrl()));
+                btnCloudflare.Text      = "■ Cloudflare 중지";
+                btnCloudflare.BackColor = Color.FromArgb(220, 38, 38);
+                SetCfStatus("터널 시작 중...", Color.Orange);
+                Log($"Cloudflare Tunnel 시작: http://localhost:{port}");
+                Log("URL 감지 대기 중... (약 5~10초 소요)");
             }
             catch (Exception ex)
             {
-                Log($"ngrok 실행 오류: {ex.Message}", Color.Red);
+                Log($"cloudflared 실행 오류: {ex.Message}", Color.Red);
             }
         }
 
-        private string? FindNgrok()
+        private string? FindCloudflared()
         {
             // 1) PATH에서 찾기
             foreach (var dir in (Environment.GetEnvironmentVariable("PATH") ?? "").Split(';'))
             {
-                var p = Path.Combine(dir.Trim(), "ngrok.exe");
+                var p = Path.Combine(dir.Trim(), "cloudflared.exe");
                 if (File.Exists(p)) return p;
             }
             // 2) 현재 실행 파일 폴더
             var appDir = Path.GetDirectoryName(Application.ExecutablePath)!;
-            var local  = Path.Combine(appDir, "ngrok.exe");
+            var local  = Path.Combine(appDir, "cloudflared.exe");
             if (File.Exists(local)) return local;
             // 3) Desktop
-            var desktop = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Desktop), "ngrok.exe");
+            var desktop = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Desktop), "cloudflared.exe");
             if (File.Exists(desktop)) return desktop;
+            // 4) winget 기본 설치 경로
+            var winget = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                @"Microsoft\WinGet\Packages\Cloudflare.cloudflared_Microsoft.Winget.Source_8wekyb3d8bbwe\cloudflared.exe");
+            if (File.Exists(winget)) return winget;
 
             return null;
-        }
-
-        private async void BtnNgrokUrl_Click(object? sender, EventArgs e)
-            => await FetchNgrokUrl();
-
-        private async Task FetchNgrokUrl()
-        {
-            try
-            {
-                using var client = new HttpClient { Timeout = TimeSpan.FromSeconds(3) };
-                var resp = await client.GetStringAsync("http://localhost:4040/api/tunnels");
-                var doc  = JsonSerializer.Deserialize<JsonElement>(resp);
-                var tunnels = doc.GetProperty("tunnels");
-
-                string? httpsUrl = null;
-                foreach (var t in tunnels.EnumerateArray())
-                {
-                    var proto = t.GetProperty("proto").GetString();
-                    if (proto == "https")
-                    {
-                        httpsUrl = t.GetProperty("public_url").GetString();
-                        break;
-                    }
-                }
-
-                if (string.IsNullOrEmpty(httpsUrl))
-                {
-                    Log("ngrok HTTPS 터널을 찾지 못했습니다.", Color.Orange);
-                    SetNgrokStatus("터널 없음", Color.Orange);
-                    return;
-                }
-
-                string redirectUri = httpsUrl.TrimEnd('/') + "/callback";
-                txtRedirectUri.Text = redirectUri;
-                SetNgrokStatus("연결됨 ✓", Color.DarkGreen);
-                Log($"ngrok URL: {redirectUri}", Color.Cyan);
-                Log("Redirect URI가 자동 입력되었습니다. Cafe24 앱 설정과 동일한지 확인하세요.", Color.Yellow);
-            }
-            catch (Exception)
-            {
-                SetNgrokStatus("API 응답 없음", Color.Red);
-                Log("ngrok API(localhost:4040)에 연결할 수 없습니다. ngrok이 실행 중인지 확인하세요.", Color.Orange);
-            }
         }
         #endregion
 
@@ -812,8 +799,8 @@ namespace Cafe24Auth
         {
             _cts?.Cancel();
             _httpListener?.Stop();
-            if (_ngrokProcess != null && !_ngrokProcess.HasExited)
-                _ngrokProcess.Kill();
+            if (_cfProcess != null && !_cfProcess.HasExited)
+                _cfProcess.Kill();
             base.OnFormClosing(e);
         }
     }
