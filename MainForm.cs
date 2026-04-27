@@ -58,7 +58,7 @@ namespace Cafe24Auth
 
         // ──────────────── 컨트롤 ────────────────
         private ComboBox txtMallId;
-        private TextBox txtTokenAlias;
+        private ComboBox txtTokenAlias;
         private TextBox txtClientId, txtClientSecret, txtRedirectUri, txtLocalPort;
         private TextBox txtAuthScope;
         private TextBox txtAccessToken, txtRefreshToken, txtExpiry, txtScope;
@@ -151,8 +151,9 @@ namespace Cafe24Auth
             AddComboRow(grpSettings, ref gy, "Mall ID:", out txtMallId, "예: myshop  (myshop.cafe24.com)");
             txtMallId.Leave += (s, e) => HandleMallIdEdited();
             txtMallId.SelectionChangeCommitted += (s, e) => HandleMallIdEdited(loadToken: true);
-            AddRow(grpSettings, ref gy, "토큰 구분명:", out txtTokenAlias, "예: android, desktop2 (비우면 기본 파일)");
+            AddComboRow(grpSettings, ref gy, "토큰 구분명:", out txtTokenAlias, "예: android, desktop2 (비우면 기본 파일)");
             txtTokenAlias.Leave += (s, e) => HandleMallIdEdited(loadToken: true);
+            txtTokenAlias.SelectionChangeCommitted += (s, e) => HandleMallIdEdited(loadToken: true);
             AddRow(grpSettings, ref gy, "Client ID:",     out txtClientId,     "Cafe24 앱 관리 > Client ID");
             AddRow(grpSettings, ref gy, "Client Secret:", out txtClientSecret, "", password: true);
             AddRow(grpSettings, ref gy, "Redirect URI:",  out txtRedirectUri,  "https://<public-domain>/callback");
@@ -666,6 +667,7 @@ namespace Cafe24Auth
                 return;
 
             RememberMallId(mallId, persist: true);
+            RefreshTokenAliasItems(mallId, CurrentTokenAlias());
             LoadMallConfig(mallId);
             if (loadToken)
                 LoadToken();
@@ -746,6 +748,80 @@ namespace Cafe24Auth
                 txtMallId.Text = currentText;
         }
 
+        private void RefreshTokenAliasItems(string? mallId, string? selectedAlias = null)
+        {
+            if (txtTokenAlias == null)
+                return;
+
+            var currentText = selectedAlias ?? txtTokenAlias.Text;
+
+            txtTokenAlias.BeginUpdate();
+            txtTokenAlias.Items.Clear();
+            foreach (var alias in CollectTokenAliases(mallId))
+                txtTokenAlias.Items.Add(alias);
+            txtTokenAlias.EndUpdate();
+
+            txtTokenAlias.Text = currentText ?? "";
+        }
+
+        private List<string> CollectTokenAliases(string? mallId)
+        {
+            var aliases = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            if (string.IsNullOrWhiteSpace(mallId))
+                return new List<string>();
+
+            void AddAlias(string? alias)
+            {
+                alias = SafeTokenAlias(alias);
+                if (!string.IsNullOrWhiteSpace(alias))
+                    aliases.Add(alias);
+            }
+
+            if (File.Exists(SETTINGS_PATH))
+            {
+                try
+                {
+                    var settings = JsonSerializer.Deserialize<AppSettings>(File.ReadAllText(SETTINGS_PATH));
+                    if (settings?.mall_configs != null)
+                    {
+                        foreach (var pair in settings.mall_configs)
+                        {
+                            if (pair.Key.StartsWith($"{mallId}|", StringComparison.OrdinalIgnoreCase))
+                                AddAlias(pair.Key.Substring(mallId.Length + 1));
+
+                            var config = pair.Value;
+                            if (string.Equals(config.mall_id, mallId, StringComparison.OrdinalIgnoreCase))
+                                AddAlias(config.token_alias);
+                        }
+                    }
+                }
+                catch { }
+            }
+
+            if (Directory.Exists(KEY_DIR))
+            {
+                foreach (var path in Directory.EnumerateFiles(KEY_DIR, "cafe24_token_*.json"))
+                {
+                    var name = Path.GetFileNameWithoutExtension(path);
+                    var prefix = $"cafe24_token_{mallId}";
+                    if (name.StartsWith(prefix + "_", StringComparison.OrdinalIgnoreCase))
+                        AddAlias(name.Substring(prefix.Length + 1));
+
+                    try
+                    {
+                        var token = JsonSerializer.Deserialize<Cafe24Token>(File.ReadAllText(path));
+                        if (token != null && string.Equals(token.MallId, mallId, StringComparison.OrdinalIgnoreCase))
+                            AddAlias(token.TokenAlias);
+                    }
+                    catch { }
+                }
+            }
+
+            var list = aliases.ToList();
+            list.Sort(StringComparer.OrdinalIgnoreCase);
+            return list;
+        }
+
         private AppSettings BuildCurrentSettings()
         {
             string currentMallId = txtMallId.Text.Trim();
@@ -797,6 +873,7 @@ namespace Cafe24Auth
             var settings = BuildCurrentSettings();
             Directory.CreateDirectory(KEY_DIR);
             File.WriteAllText(SETTINGS_PATH, JsonSerializer.Serialize(settings, new JsonSerializerOptions { WriteIndented = true }));
+            RefreshTokenAliasItems(settings.mall_id, settings.token_alias);
             Log("설정 저장 완료");
 
             if (showMessage)
@@ -821,6 +898,7 @@ namespace Cafe24Auth
                 RememberMallId(s.mall_id, persist: false);
                 txtMallId.Text       = s.mall_id;
                 txtTokenAlias.Text   = s.token_alias;
+                RefreshTokenAliasItems(s.mall_id, s.token_alias);
                 txtClientId.Text     = s.client_id;
                 txtClientSecret.Text = s.client_secret;
                 txtRedirectUri.Text  = s.redirect_uri;
@@ -869,8 +947,8 @@ namespace Cafe24Auth
                 txtMallId.Text = token.MallId;
                 RememberMallId(token.MallId, persist: false);
             }
-            if (!string.IsNullOrWhiteSpace(token.TokenAlias))
-                txtTokenAlias.Text = token.TokenAlias;
+            txtTokenAlias.Text = token.TokenAlias ?? "";
+            RefreshTokenAliasItems(token.MallId, token.TokenAlias);
             if (!string.IsNullOrWhiteSpace(token.ClientId))
                 txtClientId.Text = token.ClientId;
             if (!string.IsNullOrWhiteSpace(token.ClientSecret))
@@ -961,6 +1039,7 @@ namespace Cafe24Auth
             Directory.CreateDirectory(KEY_DIR);
             File.WriteAllText(path, JsonSerializer.Serialize(token, new JsonSerializerOptions { WriteIndented = true }));
             RememberMallId(token.MallId, persist: true);
+            RefreshTokenAliasItems(token.MallId, token.TokenAlias);
             Log($"토큰 저장 → {Path.GetFileName(path)}");
         }
         #endregion
