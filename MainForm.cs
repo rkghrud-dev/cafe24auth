@@ -21,12 +21,44 @@ namespace Cafe24Auth
         private static readonly string KEY_DIR       = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory), "key");
         private static readonly string SETTINGS_PATH = Path.Combine(KEY_DIR, "cafe24_settings.json");
 
-        // 토큰 경로: mall_id 포함
+        // 토큰 경로: 같은 MallId라도 데스크탑/안드로이드 등 앱별로 분리 저장
         private string TokenPath(string mallId)
-            => Path.Combine(KEY_DIR, $"cafe24_token_{mallId}.json");
+            => TokenPath(mallId, CurrentTokenAlias());
+
+        private string TokenPath(string mallId, string? tokenAlias)
+        {
+            var safeAlias = SafeTokenAlias(tokenAlias);
+            var suffix = string.IsNullOrWhiteSpace(safeAlias) ? "" : $"_{safeAlias}";
+            return Path.Combine(KEY_DIR, $"cafe24_token_{mallId}{suffix}.json");
+        }
+
+        private string CurrentTokenAlias()
+            => txtTokenAlias?.Text.Trim() ?? "";
+
+        private static string SafeTokenAlias(string? tokenAlias)
+        {
+            if (string.IsNullOrWhiteSpace(tokenAlias)) return "";
+
+            var invalid = Path.GetInvalidFileNameChars();
+            var builder = new StringBuilder();
+            foreach (var ch in tokenAlias.Trim())
+            {
+                if (invalid.Contains(ch)) continue;
+                builder.Append(char.IsWhiteSpace(ch) ? '_' : ch);
+            }
+
+            return builder.ToString().Trim('_');
+        }
+
+        private static string TokenProfileKey(string mallId, string? tokenAlias)
+        {
+            var safeAlias = SafeTokenAlias(tokenAlias);
+            return string.IsNullOrWhiteSpace(safeAlias) ? mallId : $"{mallId}|{safeAlias}";
+        }
 
         // ──────────────── 컨트롤 ────────────────
         private ComboBox txtMallId;
+        private TextBox txtTokenAlias;
         private TextBox txtClientId, txtClientSecret, txtRedirectUri, txtLocalPort;
         private TextBox txtAuthScope;
         private TextBox txtAccessToken, txtRefreshToken, txtExpiry, txtScope;
@@ -45,13 +77,12 @@ namespace Cafe24Auth
         private readonly List<string>    _savedMallIds = new();
         private System.Windows.Forms.Timer _autoRefreshTimer = new();
         private Label   lblAutoRefresh = new();
-        private bool    _reAuthWarningShown;
-        private bool    _isAutoRefreshing;
 
         // ──────────────── DTO ────────────────
         private class Cafe24Token
         {
             public string   MallId        { get; set; } = "";
+            public string   TokenAlias    { get; set; } = "";
             public string   ClientId      { get; set; } = "";
             public string   ClientSecret  { get; set; } = "";
             public string   AccessToken   { get; set; } = "";
@@ -66,6 +97,8 @@ namespace Cafe24Auth
 
         private class MallConfig
         {
+            public string mall_id       { get; set; } = "";
+            public string token_alias   { get; set; } = "";
             public string client_id     { get; set; } = "";
             public string client_secret { get; set; } = "";
             public string scope         { get; set; } = "";
@@ -75,6 +108,7 @@ namespace Cafe24Auth
         private class AppSettings
         {
             public string mall_id       { get; set; } = "";
+            public string token_alias   { get; set; } = "";
             public List<string> mall_ids { get; set; } = new();
             public string client_id     { get; set; } = "";
             public string client_secret { get; set; } = "";
@@ -101,7 +135,7 @@ namespace Cafe24Auth
         private void InitializeUI()
         {
             Text            = "Cafe24 API 인증 관리자";
-            Size            = new Size(720, 710);
+            Size            = new Size(720, 745);
             StartPosition   = FormStartPosition.CenterScreen;
             FormBorderStyle = FormBorderStyle.FixedSingle;
             MaximizeBox     = false;
@@ -110,13 +144,15 @@ namespace Cafe24Auth
             int y = 15;
 
             // ── 앱 설정 그룹 ──
-            var grpSettings = MakeGroup("⚙  앱 설정", 10, y, 690, 305);
+            var grpSettings = MakeGroup("⚙  앱 설정", 10, y, 690, 335);
             Controls.Add(grpSettings);
 
             int gy = 28;
             AddComboRow(grpSettings, ref gy, "Mall ID:", out txtMallId, "예: myshop  (myshop.cafe24.com)");
             txtMallId.Leave += (s, e) => HandleMallIdEdited();
             txtMallId.SelectionChangeCommitted += (s, e) => HandleMallIdEdited(loadToken: true);
+            AddRow(grpSettings, ref gy, "토큰 구분명:", out txtTokenAlias, "예: android, desktop2 (비우면 기본 파일)");
+            txtTokenAlias.Leave += (s, e) => HandleMallIdEdited(loadToken: true);
             AddRow(grpSettings, ref gy, "Client ID:",     out txtClientId,     "Cafe24 앱 관리 > Client ID");
             AddRow(grpSettings, ref gy, "Client Secret:", out txtClientSecret, "", password: true);
             AddRow(grpSettings, ref gy, "Redirect URI:",  out txtRedirectUri,  "https://<public-domain>/callback");
@@ -169,7 +205,7 @@ namespace Cafe24Auth
             btnSaveSettings.Click += BtnSaveSettings_Click;
             grpSettings.Controls.Add(btnSaveSettings);
 
-            y += 315;
+            y += 345;
 
             // ── 토큰 정보 그룹 ──
             var grpToken = MakeGroup("🔑  토큰 정보", 10, y, 690, 155);
@@ -641,7 +677,8 @@ namespace Cafe24Auth
             try
             {
                 var s = JsonSerializer.Deserialize<AppSettings>(File.ReadAllText(SETTINGS_PATH));
-                if (s?.mall_configs != null && s.mall_configs.TryGetValue(mallId, out var cfg))
+                var cfg = FindMallConfig(s, mallId, CurrentTokenAlias());
+                if (cfg != null)
                 {
                     if (!string.IsNullOrEmpty(cfg.client_id))     txtClientId.Text     = cfg.client_id;
                     if (!string.IsNullOrEmpty(cfg.client_secret)) txtClientSecret.Text = cfg.client_secret;
@@ -654,6 +691,22 @@ namespace Cafe24Auth
             catch { }
         }
 
+        private static MallConfig? FindMallConfig(AppSettings? settings, string mallId, string? tokenAlias)
+        {
+            if (settings?.mall_configs == null || string.IsNullOrWhiteSpace(mallId))
+                return null;
+
+            var key = TokenProfileKey(mallId, tokenAlias);
+            if (settings.mall_configs.TryGetValue(key, out var exact))
+                return exact;
+
+            if (string.IsNullOrWhiteSpace(tokenAlias) && settings.mall_configs.TryGetValue(mallId, out var legacy))
+                return legacy;
+
+            return settings.mall_configs.Values.FirstOrDefault(config =>
+                string.Equals(config.mall_id, mallId, StringComparison.OrdinalIgnoreCase) &&
+                string.Equals(SafeTokenAlias(config.token_alias), SafeTokenAlias(tokenAlias), StringComparison.OrdinalIgnoreCase));
+        }
         private void RememberMallId(string? mallId, bool persist)
         {
             mallId = mallId?.Trim();
@@ -696,6 +749,7 @@ namespace Cafe24Auth
         private AppSettings BuildCurrentSettings()
         {
             string currentMallId = txtMallId.Text.Trim();
+            string currentTokenAlias = CurrentTokenAlias();
             RememberMallId(currentMallId, persist: false);
 
             // 기존 설정 파일의 mall_configs 불러와서 현재 몰 정보 업데이트
@@ -713,8 +767,10 @@ namespace Cafe24Auth
 
             if (!string.IsNullOrEmpty(currentMallId))
             {
-                mallConfigs[currentMallId] = new MallConfig
+                mallConfigs[TokenProfileKey(currentMallId, currentTokenAlias)] = new MallConfig
                 {
+                    mall_id       = currentMallId,
+                    token_alias   = currentTokenAlias,
                     client_id     = txtClientId.Text.Trim(),
                     client_secret = txtClientSecret.Text.Trim(),
                     scope         = txtAuthScope.Text.Trim(),
@@ -725,6 +781,7 @@ namespace Cafe24Auth
             return new AppSettings
             {
                 mall_id      = currentMallId,
+                token_alias  = currentTokenAlias,
                 mall_ids     = new List<string>(_savedMallIds),
                 client_id    = txtClientId.Text.Trim(),
                 client_secret = txtClientSecret.Text.Trim(),
@@ -763,6 +820,7 @@ namespace Cafe24Auth
                 }
                 RememberMallId(s.mall_id, persist: false);
                 txtMallId.Text       = s.mall_id;
+                txtTokenAlias.Text   = s.token_alias;
                 txtClientId.Text     = s.client_id;
                 txtClientSecret.Text = s.client_secret;
                 txtRedirectUri.Text  = s.redirect_uri;
@@ -792,6 +850,8 @@ namespace Cafe24Auth
             try
             {
                 var t = JsonSerializer.Deserialize<Cafe24Token>(File.ReadAllText(path))!;
+                if (string.IsNullOrWhiteSpace(t.TokenAlias))
+                    t.TokenAlias = CurrentTokenAlias();
                 RememberMallId(mallId, persist: false);
                 ApplyTokenSettings(t);
                 DisplayToken(t);
@@ -809,6 +869,8 @@ namespace Cafe24Auth
                 txtMallId.Text = token.MallId;
                 RememberMallId(token.MallId, persist: false);
             }
+            if (!string.IsNullOrWhiteSpace(token.TokenAlias))
+                txtTokenAlias.Text = token.TokenAlias;
             if (!string.IsNullOrWhiteSpace(token.ClientId))
                 txtClientId.Text = token.ClientId;
             if (!string.IsNullOrWhiteSpace(token.ClientSecret))
@@ -850,6 +912,13 @@ namespace Cafe24Auth
                 try
                 {
                     var settings = JsonSerializer.Deserialize<AppSettings>(File.ReadAllText(SETTINGS_PATH));
+                    var config = FindMallConfig(settings, mallId, CurrentTokenAlias());
+                    if (config != null && !string.IsNullOrWhiteSpace(config.redirect_uri))
+                    {
+                        txtRedirectUri.Text = config.redirect_uri;
+                        return;
+                    }
+
                     if (settings != null && !string.IsNullOrWhiteSpace(settings.redirect_uri))
                     {
                         txtRedirectUri.Text = settings.redirect_uri;
@@ -886,7 +955,9 @@ namespace Cafe24Auth
 
         private void SaveToken(Cafe24Token token)
         {
-            string path = TokenPath(token.MallId);
+            if (string.IsNullOrWhiteSpace(token.TokenAlias))
+                token.TokenAlias = CurrentTokenAlias();
+            string path = TokenPath(token.MallId, token.TokenAlias);
             Directory.CreateDirectory(KEY_DIR);
             File.WriteAllText(path, JsonSerializer.Serialize(token, new JsonSerializerOptions { WriteIndented = true }));
             RememberMallId(token.MallId, persist: true);
@@ -1173,10 +1244,12 @@ namespace Cafe24Auth
                 }
 
                 var token = ParseToken(body, mallId, clientId, clientSecret, redirectUri, scope);
+                token.TokenAlias = CurrentTokenAlias();
                 SaveToken(token);
                 DisplayToken(token);
-                Log($"✅ 토큰 발급 완료! → cafe24_token_{mallId}.json", Color.Cyan);
-                MessageBox.Show($"Cafe24 API 인증이 완료되었습니다!\n저장: cafe24_token_{mallId}.json", "인증 완료", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                var savedFile = Path.GetFileName(TokenPath(token.MallId, token.TokenAlias));
+                Log($"✅ 토큰 발급 완료! → {savedFile}", Color.Cyan);
+                MessageBox.Show($"Cafe24 API 인증이 완료되었습니다!\n저장: {savedFile}", "인증 완료", MessageBoxButtons.OK, MessageBoxIcon.Information);
             }
             catch (Exception ex)
             {
@@ -1209,6 +1282,8 @@ namespace Cafe24Auth
             try
             {
                 var t = JsonSerializer.Deserialize<Cafe24Token>(File.ReadAllText(path))!;
+                if (string.IsNullOrWhiteSpace(t.TokenAlias))
+                    t.TokenAlias = CurrentTokenAlias();
                 if (string.IsNullOrEmpty(t.RefreshToken))
                 {
                     Log("Refresh Token이 없습니다. 다시 OAuth 인증을 진행하세요.", Color.Red);
@@ -1263,6 +1338,7 @@ namespace Cafe24Auth
                 }
 
                 var token = ParseToken(body, mallId, clientId, clientSecret, existing.RedirectUri, existing.Scope);
+                token.TokenAlias = existing.TokenAlias;
                 if (string.IsNullOrEmpty(token.RefreshToken))
                 {
                     // Cafe24가 새 refresh_token을 안 줬으면 기존 것 유지 + 발급일도 유지
@@ -1295,6 +1371,7 @@ namespace Cafe24Auth
             return new Cafe24Token
             {
                 MallId                = mallId,
+                TokenAlias            = "",
                 ClientId              = clientId,
                 ClientSecret          = clientSecret,
                 AccessToken           = d.TryGetProperty("access_token",  out var at) ? at.GetString() ?? "" : "",
@@ -1311,139 +1388,43 @@ namespace Cafe24Auth
 
         // ══════════════════════════════════════════
         #region 자동갱신 타이머
-        private async void AutoRefreshTimer_Tick(object? sender, EventArgs e)
+        private void AutoRefreshTimer_Tick(object? sender, EventArgs e)
         {
-            if (_isAuthRunning || _isAutoRefreshing)
+            if (_isAuthRunning)
                 return;
 
-            _isAutoRefreshing = true;
-            var previousRefreshEnabled = btnRefreshToken.Enabled;
+            UpdateSelectedTokenStatus();
+        }
+
+        private void UpdateSelectedTokenStatus()
+        {
+            var mallId = txtMallId.Text.Trim();
+            if (string.IsNullOrWhiteSpace(mallId))
+                return;
+
+            var path = TokenPath(mallId);
+            if (!File.Exists(path))
+            {
+                lblAutoRefresh.Text = $"토큰 파일 없음: {Path.GetFileName(path)}";
+                lblAutoRefresh.ForeColor = Color.DimGray;
+                return;
+            }
+
             try
             {
-                btnRefreshToken.Enabled = false;
-                await AutoRefreshKnownTokenFilesAsync();
+                var token = JsonSerializer.Deserialize<Cafe24Token>(File.ReadAllText(path));
+                if (token == null || string.IsNullOrWhiteSpace(token.AccessToken))
+                    return;
+
+                var now = DateTime.Now;
+                var accessRemain = token.UpdatedAt.AddHours(2) - now;
+                var rtBase = token.RefreshTokenUpdatedAt == default ? token.UpdatedAt : token.RefreshTokenUpdatedAt;
+                var refreshRemain = rtBase == default ? TimeSpan.Zero : rtBase.AddDays(14) - now;
+                UpdateAutoRefreshLabel(accessRemain, refreshRemain);
             }
-            finally
+            catch
             {
-                _isAutoRefreshing = false;
-                btnRefreshToken.Enabled = previousRefreshEnabled && !_isAuthRunning;
             }
-        }
-
-        private async Task AutoRefreshKnownTokenFilesAsync()
-        {
-            var tokenPaths = GetKnownTokenPaths();
-            if (tokenPaths.Count == 0)
-                return;
-
-            var selectedMallId = txtMallId.Text.Trim();
-            var selectedMallSeen = false;
-            var refreshedCount = 0;
-            var refreshWarningMall = "";
-            var refreshWarningRemain = TimeSpan.MaxValue;
-            var now = DateTime.Now;
-
-            foreach (var path in tokenPaths)
-            {
-                Cafe24Token? t;
-                try
-                {
-                    t = JsonSerializer.Deserialize<Cafe24Token>(File.ReadAllText(path));
-                }
-                catch (Exception ex)
-                {
-                    Log($"토큰 파일 읽기 실패: {Path.GetFileName(path)} - {ex.Message}", Color.Orange);
-                    continue;
-                }
-
-                if (t == null)
-                    continue;
-
-                if (string.IsNullOrWhiteSpace(t.MallId))
-                    t.MallId = MallIdFromTokenPath(path);
-
-                if (string.IsNullOrWhiteSpace(t.MallId) ||
-                    string.IsNullOrWhiteSpace(t.AccessToken) ||
-                    string.IsNullOrWhiteSpace(t.RefreshToken))
-                    continue;
-
-                var accessExpiry = t.UpdatedAt.AddHours(2);
-                var rtBase = t.RefreshTokenUpdatedAt == default ? t.UpdatedAt : t.RefreshTokenUpdatedAt;
-                var refreshExpiry = rtBase.AddDays(14);
-                var accessRemain = accessExpiry - now;
-                var refreshRemain = refreshExpiry - now;
-                var isSelectedMall = string.Equals(selectedMallId, t.MallId, StringComparison.OrdinalIgnoreCase);
-
-                if (isSelectedMall)
-                {
-                    selectedMallSeen = true;
-                    UpdateAutoRefreshLabel(accessRemain, refreshRemain);
-                }
-
-                if (refreshRemain < refreshWarningRemain)
-                {
-                    refreshWarningRemain = refreshRemain;
-                    refreshWarningMall = t.MallId;
-                }
-
-                if (accessRemain.TotalMinutes >= 5 || refreshRemain.TotalSeconds <= 0)
-                    continue;
-
-                var (clientId, clientSecret) = ResolveClientCredentials(t);
-                if (string.IsNullOrWhiteSpace(clientId) || string.IsNullOrWhiteSpace(clientSecret))
-                {
-                    Log($"[{t.MallId}] Client ID/Secret이 없어 자동갱신을 건너뜁니다.", Color.Orange);
-                    continue;
-                }
-
-                Log($"[{t.MallId}] Access Token 자동갱신 시작...", Color.Cyan);
-                await RefreshAccessToken(t.MallId, clientId, clientSecret, t.RefreshToken, t, updateDisplay: isSelectedMall, showFailureDialog: false);
-                refreshedCount++;
-            }
-
-            if (!selectedMallSeen && tokenPaths.Count > 0)
-            {
-                lblAutoRefresh.Text = refreshedCount > 0
-                    ? $"🔄 Cafe24 JSON {refreshedCount}개 자동갱신 완료 — {tokenPaths.Count}개 감시 중"
-                    : $"🔄 Cafe24 JSON {tokenPaths.Count}개 자동갱신 감시 중";
-                lblAutoRefresh.ForeColor = Color.DimGray;
-            }
-
-            if (refreshWarningRemain.TotalDays < 2 && !_reAuthWarningShown)
-            {
-                _reAuthWarningShown = true;
-                var msg = refreshWarningRemain.TotalHours < 1
-                    ? $"⚠ {refreshWarningMall} Refresh Token이 {(int)refreshWarningRemain.TotalMinutes}분 후 만료됩니다!\n즉시 '🔐 재인증'을 눌러주세요."
-                    : $"⚠ {refreshWarningMall} Refresh Token이 {(int)refreshWarningRemain.TotalHours}시간 후 만료됩니다.\n'🔐 재인증' 버튼으로 재인증하세요.";
-                MessageBox.Show(msg, "재인증 필요", MessageBoxButtons.OK, MessageBoxIcon.Warning);
-            }
-        }
-
-        private List<string> GetKnownTokenPaths()
-        {
-            var paths = new List<string>();
-            if (!Directory.Exists(KEY_DIR))
-                return paths;
-
-            foreach (var path in Directory.EnumerateFiles(KEY_DIR, "cafe24_token_*.json"))
-            {
-                var fileName = Path.GetFileName(path);
-                if (string.Equals(fileName, "cafe24_token.json", StringComparison.OrdinalIgnoreCase))
-                    continue;
-
-                paths.Add(path);
-            }
-
-            return paths;
-        }
-
-        private static string MallIdFromTokenPath(string path)
-        {
-            const string prefix = "cafe24_token_";
-            var name = Path.GetFileNameWithoutExtension(path);
-            return name.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)
-                ? name.Substring(prefix.Length)
-                : "";
         }
 
         private (string ClientId, string ClientSecret) ResolveClientCredentials(Cafe24Token token)
@@ -1458,7 +1439,8 @@ namespace Cafe24Auth
                 if (File.Exists(SETTINGS_PATH))
                 {
                     var settings = JsonSerializer.Deserialize<AppSettings>(File.ReadAllText(SETTINGS_PATH));
-                    if (settings?.mall_configs != null && settings.mall_configs.TryGetValue(token.MallId, out var config))
+                    var config = FindMallConfig(settings, token.MallId, token.TokenAlias);
+                    if (config != null)
                     {
                         if (string.IsNullOrWhiteSpace(clientId))
                             clientId = config.client_id;
@@ -1471,7 +1453,8 @@ namespace Cafe24Auth
             {
             }
 
-            if (string.Equals(txtMallId.Text.Trim(), token.MallId, StringComparison.OrdinalIgnoreCase))
+            if (string.Equals(txtMallId.Text.Trim(), token.MallId, StringComparison.OrdinalIgnoreCase) &&
+                string.Equals(SafeTokenAlias(CurrentTokenAlias()), SafeTokenAlias(token.TokenAlias), StringComparison.OrdinalIgnoreCase))
             {
                 if (string.IsNullOrWhiteSpace(clientId))
                     clientId = txtClientId.Text.Trim();
@@ -1493,17 +1476,17 @@ namespace Cafe24Auth
             }
             else if (accessRemain.TotalMinutes < 5)
             {
-                lblAutoRefresh.Text      = "⏰ Access Token 갱신 중...";
+                lblAutoRefresh.Text      = "⚠ Access Token 만료 임박 — 앱 또는 토큰 갱신 버튼으로 갱신";
                 lblAutoRefresh.ForeColor = Color.Orange;
             }
             else if (accessRemain.TotalSeconds > 0)
             {
-                lblAutoRefresh.Text      = $"🔄 자동갱신 대기 중 — Access Token 만료까지 {(int)accessRemain.TotalHours}h {accessRemain.Minutes}m | Refresh Token D-{(int)refreshRemain.TotalDays}";
+                lblAutoRefresh.Text      = $"토큰 상태 — Access Token {(int)accessRemain.TotalHours}h {accessRemain.Minutes}m 남음 | Refresh Token D-{(int)refreshRemain.TotalDays}";
                 lblAutoRefresh.ForeColor = Color.DimGray;
             }
             else
             {
-                lblAutoRefresh.Text      = "⚠ Access Token 만료됨 — 자동갱신 시도 중...";
+                lblAutoRefresh.Text      = "⚠ Access Token 만료됨 — 앱 또는 토큰 갱신 버튼으로 갱신";
                 lblAutoRefresh.ForeColor = Color.DarkOrange;
             }
         }
