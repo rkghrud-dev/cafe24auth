@@ -3,8 +3,10 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
 using System.IO;
+using System.Linq;
 using System.Net;
 using System.Net.Http;
+using System.Net.Sockets;
 using System.Text;
 using System.Text.Json;
 using System.Threading;
@@ -16,7 +18,7 @@ namespace Cafe24Auth
     public class MainForm : Form
     {
         // ──────────────── 상수 ────────────────
-        private static readonly string KEY_DIR       = @"C:\Users\rkghr\Desktop\key";
+        private static readonly string KEY_DIR       = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory), "key");
         private static readonly string SETTINGS_PATH = Path.Combine(KEY_DIR, "cafe24_settings.json");
 
         // 토큰 경로: mall_id 포함
@@ -35,7 +37,7 @@ namespace Cafe24Auth
         private Label   lblStatus;
 
         // ──────────────── 런타임 ────────────────
-        private HttpListener?            _httpListener;
+        private TcpListener?             _tcpListener;
         private CancellationTokenSource? _cts;
         private Process?                 _tunnelProcess;
         private bool                     _isAuthRunning;
@@ -44,6 +46,7 @@ namespace Cafe24Auth
         private System.Windows.Forms.Timer _autoRefreshTimer = new();
         private Label   lblAutoRefresh = new();
         private bool    _reAuthWarningShown;
+        private bool    _isAutoRefreshing;
 
         // ──────────────── DTO ────────────────
         private class Cafe24Token
@@ -568,6 +571,37 @@ namespace Cafe24Auth
             return true;
         }
 
+        private async Task<bool> WaitForNgrokTunnelReadyAsync(string redirectUri)
+        {
+            if (IsLoopbackRedirectUri(redirectUri))
+                return true;
+
+            if (!TryBuildNgrokPublicUrl(redirectUri, out var expectedPublicUrl))
+                return false;
+
+            using var client = new HttpClient { Timeout = TimeSpan.FromSeconds(2) };
+            for (var attempt = 0; attempt < 20; attempt++)
+            {
+                try
+                {
+                    var json = await client.GetStringAsync("http://127.0.0.1:4040/api/tunnels");
+                    if (json.Contains($"\"public_url\":\"{expectedPublicUrl}\"", StringComparison.OrdinalIgnoreCase))
+                    {
+                        Log($"ngrok 터널 준비 완료: {expectedPublicUrl}", Color.Cyan);
+                        return true;
+                    }
+                }
+                catch
+                {
+                }
+
+                await Task.Delay(500);
+            }
+
+            Log($"ngrok 터널 준비 확인 실패: {expectedPublicUrl}", Color.Orange);
+            return false;
+        }
+
         private void HandleNgrokError(string data)
         {
             Log($"ngrok 오류: {data}", Color.Red);
@@ -864,14 +898,10 @@ namespace Cafe24Auth
         #region OAuth 인증
         private async void BtnStartAuth_Click(object? sender, EventArgs e)
         {
-            // 인증 중이면 → 중지
             if (_isAuthRunning)
             {
-                _cts?.Cancel();
-                _httpListener?.Stop();
-                SetAuthRunning(false);
-                SetStatus("중지됨", Color.Gray);
-                Log("인증이 중지되었습니다.", Color.Orange);
+                MessageBox.Show("이미 인증이 진행 중입니다. 브라우저에서 로그인과 권한 승인을 완료할 때까지 기다리세요.",
+                    "인증 진행 중", MessageBoxButtons.OK, MessageBoxIcon.Information);
                 return;
             }
 
@@ -884,9 +914,17 @@ namespace Cafe24Auth
                 return;
             }
 
+            var redirectUri = txtRedirectUri.Text.Trim();
+            if (!IsLoopbackRedirectUri(redirectUri) && !await WaitForNgrokTunnelReadyAsync(redirectUri))
+            {
+                MessageBox.Show("ngrok 고정 주소가 아직 준비되지 않았습니다. 'ngrok 실행' 후 상태가 연결됨인지 확인하고 다시 시도하세요.",
+                    "ngrok 준비 필요", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+
             SetAuthRunning(true);
             SetStatus("인증 중...", Color.Orange);
-            try   { await StartOAuthFlow(); }
+            try { await StartOAuthFlow(); }
             finally { SetAuthRunning(false); }
         }
 
@@ -895,17 +933,20 @@ namespace Cafe24Auth
             _isAuthRunning = running;
             if (running)
             {
-                btnStartAuth.Text      = "⏹ 인증 중지";
-                btnStartAuth.BackColor = Color.FromArgb(220, 38, 38);
+                btnStartAuth.Text      = "승인 대기 중...";
+                btnStartAuth.BackColor = Color.FromArgb(37, 99, 235);
             }
             else
             {
                 btnStartAuth.Text      = "🔐 재인증";
                 btnStartAuth.BackColor = Color.FromArgb(37, 99, 235);
             }
-            // 인증 중에는 갱신/설정저장 비활성
+
+            btnStartAuth.Enabled     = !running;
+            btnTunnel.Enabled        = !running;
             btnRefreshToken.Enabled  = !running;
             btnSaveSettings.Enabled  = !running;
+            btnLoadToken.Enabled     = !running;
         }
 
         private async Task StartOAuthFlow()
@@ -917,17 +958,26 @@ namespace Cafe24Auth
             int    port         = int.Parse(txtLocalPort.Text.Trim());
 
             var redirectUriObj = new Uri(redirectUri);
-            var listenerPrefixes = BuildListenerPrefixes(redirectUriObj, port);
+            var callbackPath = string.IsNullOrWhiteSpace(redirectUriObj.AbsolutePath)
+                ? "/"
+                : redirectUriObj.AbsolutePath.TrimEnd('/');
+            if (string.IsNullOrWhiteSpace(callbackPath))
+                callbackPath = "/";
 
-            _cts          = new CancellationTokenSource();
-            _httpListener = new HttpListener();
-            foreach (var prefix in listenerPrefixes)
-                _httpListener.Prefixes.Add(prefix);
+            var callbackUrls = new List<string>
+            {
+                $"http://localhost:{port}{callbackPath}",
+                $"http://127.0.0.1:{port}{callbackPath}"
+            };
+
+            _cts = new CancellationTokenSource();
+            _tcpListener = new TcpListener(IPAddress.IPv6Any, port);
+            _tcpListener.Server.DualMode = true;
 
             try
             {
-                _httpListener.Start();
-                Log($"로컬 서버 시작: {string.Join(", ", listenerPrefixes)}");
+                _tcpListener.Start();
+                Log($"로컬 서버 시작: {string.Join(", ", callbackUrls)}", Color.Cyan);
             }
             catch (Exception ex)
             {
@@ -945,11 +995,12 @@ namespace Cafe24Auth
                 MessageBox.Show("API Scope를 입력하세요.\n\nCafe24 개발자센터 → 앱 수정 → STEP 03에서 등록된 권한을 확인하세요.\n예: mall.read_product,mall.write_product", "Scope 없음", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                 return;
             }
+
             string state   = Guid.NewGuid().ToString("N");
             string authUrl = $"https://{mallId}.cafe24api.com/api/v2/oauth/authorize" +
                              $"?response_type=code" +
                              $"&client_id={Uri.EscapeDataString(clientId)}" +
-                             $"&state={state}" +
+                             $"&state={Uri.EscapeDataString(state)}" +
                              $"&redirect_uri={Uri.EscapeDataString(redirectUri)}" +
                              $"&scope={Uri.EscapeDataString(scope)}";
 
@@ -962,27 +1013,19 @@ namespace Cafe24Auth
 
             try
             {
-                var context = await Task.Run(() => _httpListener!.GetContext(), _cts.Token);
-                var qs = context.Request.QueryString;
+                var query = await WaitForCallbackQueryAsync(_tcpListener, callbackPath, _cts.Token);
 
-                string html = "<html><meta charset='utf-8'><body style='font-family:Arial;text-align:center;padding:60px'>" +
-                              "<h2 style='color:#16a34a'>✅ 인증 완료!</h2><p>이 창을 닫고 프로그램으로 돌아오세요.</p></body></html>";
-                byte[] buf = Encoding.UTF8.GetBytes(html);
-                context.Response.ContentType     = "text/html; charset=utf-8";
-                context.Response.ContentLength64 = buf.Length;
-                context.Response.OutputStream.Write(buf, 0, buf.Length);
-                context.Response.Close();
-
-                string? errorParam = qs["error"];
+                query.TryGetValue("error", out var errorParam);
+                query.TryGetValue("error_description", out var errorDescription);
                 if (!string.IsNullOrEmpty(errorParam))
                 {
-                    Log($"인증 거부/오류: {errorParam} - {qs["error_description"]}", Color.Red);
+                    Log($"인증 거부/오류: {errorParam} - {errorDescription}", Color.Red);
                     SetStatus("인증 실패", Color.Red);
                     return;
                 }
 
-                string? code          = qs["code"];
-                string? returnedState = qs["state"];
+                query.TryGetValue("code", out var code);
+                query.TryGetValue("state", out var returnedState);
 
                 if (string.IsNullOrEmpty(code))
                 {
@@ -1001,7 +1044,7 @@ namespace Cafe24Auth
                 Log("인증 코드 수신 완료. 토큰 교환 중...");
                 await ExchangeCodeForToken(mallId, clientId, clientSecret, code, redirectUri, scope);
             }
-            catch (TaskCanceledException)
+            catch (OperationCanceledException)
             {
                 Log("인증이 취소되었습니다.", Color.Orange);
                 SetStatus("취소됨", Color.Gray);
@@ -1013,12 +1056,94 @@ namespace Cafe24Auth
             }
             finally
             {
-                _httpListener?.Stop();
-                _httpListener?.Close();
+                try { _tcpListener?.Stop(); }
+                catch { }
+                _tcpListener = null;
                 Log("로컬 서버 종료");
             }
-        }
 
+            async Task<Dictionary<string, string>> WaitForCallbackQueryAsync(TcpListener listener, string expectedPath, CancellationToken cancellationToken)
+            {
+                while (true)
+                {
+                    using var client = await listener.AcceptTcpClientAsync(cancellationToken);
+                    using var stream = client.GetStream();
+                    using var reader = new StreamReader(stream, Encoding.ASCII, false, 8192, leaveOpen: true);
+
+                    var requestLine = await reader.ReadLineAsync();
+                    if (string.IsNullOrWhiteSpace(requestLine))
+                    {
+                        await WriteHttpResponseAsync(stream, 400, "Bad Request", "<html><meta charset='utf-8'><body><h3>잘못된 요청입니다.</h3></body></html>");
+                        continue;
+                    }
+
+                    string? hostHeader = null;
+                    while (true)
+                    {
+                        var headerLine = await reader.ReadLineAsync();
+                        if (string.IsNullOrEmpty(headerLine))
+                            break;
+
+                        if (headerLine.StartsWith("Host:", StringComparison.OrdinalIgnoreCase))
+                            hostHeader = headerLine.Substring(5).Trim();
+                    }
+
+                    var parts = requestLine.Split(' ');
+                    if (parts.Length < 2)
+                    {
+                        await WriteHttpResponseAsync(stream, 400, "Bad Request", "<html><meta charset='utf-8'><body><h3>요청 형식이 올바르지 않습니다.</h3></body></html>");
+                        continue;
+                    }
+
+                    var requestTarget = parts[1];
+                    var requestUri = new Uri($"http://localhost{requestTarget}");
+                    var requestPath = string.IsNullOrWhiteSpace(requestUri.AbsolutePath)
+                        ? "/"
+                        : requestUri.AbsolutePath.TrimEnd('/');
+                    if (string.IsNullOrWhiteSpace(requestPath))
+                        requestPath = "/";
+
+                    Log($"콜백 요청 수신: {requestPath} | Host={hostHeader ?? "(없음)"}", Color.Cyan);
+
+                    if (!string.Equals(requestPath, expectedPath, StringComparison.OrdinalIgnoreCase))
+                    {
+                        await WriteHttpResponseAsync(stream, 404, "Not Found", "<html><meta charset='utf-8'><body><h3>잘못된 콜백 경로입니다.</h3></body></html>");
+                        continue;
+                    }
+
+                    const string successHtml = "<html><meta charset='utf-8'><body style='font-family:Arial;text-align:center;padding:60px'><h2 style='color:#16a34a'>✅ 인증 완료!</h2><p>이 창을 닫고 프로그램으로 돌아오세요.</p></body></html>";
+                    await WriteHttpResponseAsync(stream, 200, "OK", successHtml);
+                    return ParseQueryParameters(requestUri.Query);
+                }
+            }
+
+            static Dictionary<string, string> ParseQueryParameters(string query)
+            {
+                var result = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                if (string.IsNullOrEmpty(query))
+                    return result;
+
+                foreach (var pair in query.TrimStart('?').Split('&', StringSplitOptions.RemoveEmptyEntries))
+                {
+                    var idx = pair.IndexOf('=');
+                    var key = idx >= 0 ? pair.Substring(0, idx) : pair;
+                    var value = idx >= 0 ? pair.Substring(idx + 1) : string.Empty;
+                    result[Uri.UnescapeDataString(key)] = Uri.UnescapeDataString(value.Replace('+', ' '));
+                }
+
+                return result;
+            }
+
+            static async Task WriteHttpResponseAsync(NetworkStream stream, int statusCode, string statusText, string html)
+            {
+                var bodyBytes = Encoding.UTF8.GetBytes(html);
+                var headers = $"HTTP/1.1 {statusCode} {statusText}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {bodyBytes.Length}\r\nConnection: close\r\n\r\n";
+                var headerBytes = Encoding.ASCII.GetBytes(headers);
+                await stream.WriteAsync(headerBytes, 0, headerBytes.Length);
+                await stream.WriteAsync(bodyBytes, 0, bodyBytes.Length);
+                await stream.FlushAsync();
+            }
+        }
         private async Task ExchangeCodeForToken(string mallId, string clientId, string clientSecret, string code, string redirectUri, string scope)
         {
             string tokenUrl    = $"https://{mallId}.cafe24api.com/api/v2/oauth/token";
@@ -1108,7 +1233,7 @@ namespace Cafe24Auth
             }
         }
 
-        private async Task RefreshAccessToken(string mallId, string clientId, string clientSecret, string refreshToken, Cafe24Token existing)
+        private async Task RefreshAccessToken(string mallId, string clientId, string clientSecret, string refreshToken, Cafe24Token existing, bool updateDisplay = true, bool showFailureDialog = true)
         {
             string tokenUrl    = $"https://{mallId}.cafe24api.com/api/v2/oauth/token";
             string credentials = Convert.ToBase64String(Encoding.ASCII.GetBytes($"{clientId}:{clientSecret}"));
@@ -1132,7 +1257,8 @@ namespace Cafe24Auth
                     Log($"갱신 실패 ({(int)resp.StatusCode}): {body}", Color.Red);
                     Log("Refresh Token이 만료된 경우 OAuth 인증을 다시 진행하세요.", Color.Orange);
                     SetStatus("갱신 실패", Color.Red);
-                    MessageBox.Show($"토큰 갱신 실패:\n{body}\n\n'OAuth 인증 시작'으로 재인증하세요.", "갱신 실패", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    if (showFailureDialog)
+                        MessageBox.Show($"토큰 갱신 실패:\n{body}\n\n'OAuth 인증 시작'으로 재인증하세요.", "갱신 실패", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                     return;
                 }
 
@@ -1147,8 +1273,9 @@ namespace Cafe24Auth
                 }
 
                 SaveToken(token);
-                DisplayToken(token);
-                Log("✅ 토큰 갱신 완료!", Color.Cyan);
+                if (updateDisplay || string.Equals(txtMallId.Text.Trim(), token.MallId, StringComparison.OrdinalIgnoreCase))
+                    DisplayToken(token);
+                Log($"[{token.MallId}] 토큰 갱신 완료!", Color.Cyan);
             }
             catch (Exception ex)
             {
@@ -1186,53 +1313,173 @@ namespace Cafe24Auth
         #region 자동갱신 타이머
         private async void AutoRefreshTimer_Tick(object? sender, EventArgs e)
         {
-            string mallId = txtMallId.Text.Trim();
-            if (string.IsNullOrEmpty(mallId) || _isAuthRunning) return;
+            if (_isAuthRunning || _isAutoRefreshing)
+                return;
 
-            string path = TokenPath(mallId);
-            if (!File.Exists(path)) return;
-
-            Cafe24Token t;
-            try { t = JsonSerializer.Deserialize<Cafe24Token>(File.ReadAllText(path))!; }
-            catch { return; }
-
-            if (string.IsNullOrEmpty(t.AccessToken)) return;
-
-            var accessExpiry  = t.UpdatedAt.AddHours(2);
-            var rtBase        = t.RefreshTokenUpdatedAt == default ? t.UpdatedAt : t.RefreshTokenUpdatedAt;
-            var refreshExpiry = rtBase.AddDays(14);
-            var now           = DateTime.Now;
-
-            var accessRemain  = accessExpiry  - now;
-            var refreshRemain = refreshExpiry - now;
-
-            // ── 라벨 업데이트 ──
-            UpdateAutoRefreshLabel(accessRemain, refreshRemain);
-
-            // ── Refresh Token 만료 경고 (2일 이내) ──
-            if (refreshRemain.TotalDays < 2 && !_reAuthWarningShown)
+            _isAutoRefreshing = true;
+            var previousRefreshEnabled = btnRefreshToken.Enabled;
+            try
             {
-                _reAuthWarningShown = true;
-                var msg = refreshRemain.TotalHours < 1
-                    ? $"⚠ Refresh Token이 {(int)refreshRemain.TotalMinutes}분 후 만료됩니다!\n즉시 '🔐 재인증'을 눌러주세요."
-                    : $"⚠ Refresh Token이 {(int)refreshRemain.TotalHours}시간 후 만료됩니다.\n'🔐 재인증' 버튼으로 재인증하세요.";
-                MessageBox.Show(msg, "재인증 필요", MessageBoxButtons.OK, MessageBoxIcon.Warning);
-            }
-
-            // ── Access Token 자동갱신 (만료 5분 전) ──
-            if (accessRemain.TotalMinutes < 5 && refreshRemain.TotalSeconds > 0
-                && !string.IsNullOrEmpty(t.RefreshToken) && !btnRefreshToken.Enabled == false)
-            {
-                Log("⏰ Access Token 자동갱신 시작...", Color.Cyan);
                 btnRefreshToken.Enabled = false;
+                await AutoRefreshKnownTokenFilesAsync();
+            }
+            finally
+            {
+                _isAutoRefreshing = false;
+                btnRefreshToken.Enabled = previousRefreshEnabled && !_isAuthRunning;
+            }
+        }
+
+        private async Task AutoRefreshKnownTokenFilesAsync()
+        {
+            var tokenPaths = GetKnownTokenPaths();
+            if (tokenPaths.Count == 0)
+                return;
+
+            var selectedMallId = txtMallId.Text.Trim();
+            var selectedMallSeen = false;
+            var refreshedCount = 0;
+            var refreshWarningMall = "";
+            var refreshWarningRemain = TimeSpan.MaxValue;
+            var now = DateTime.Now;
+
+            foreach (var path in tokenPaths)
+            {
+                Cafe24Token? t;
                 try
                 {
-                    string clientId     = string.IsNullOrEmpty(t.ClientId)     ? txtClientId.Text.Trim()     : t.ClientId;
-                    string clientSecret = string.IsNullOrEmpty(t.ClientSecret) ? txtClientSecret.Text.Trim() : t.ClientSecret;
-                    await RefreshAccessToken(t.MallId, clientId, clientSecret, t.RefreshToken, t);
+                    t = JsonSerializer.Deserialize<Cafe24Token>(File.ReadAllText(path));
                 }
-                finally { btnRefreshToken.Enabled = true; }
+                catch (Exception ex)
+                {
+                    Log($"토큰 파일 읽기 실패: {Path.GetFileName(path)} - {ex.Message}", Color.Orange);
+                    continue;
+                }
+
+                if (t == null)
+                    continue;
+
+                if (string.IsNullOrWhiteSpace(t.MallId))
+                    t.MallId = MallIdFromTokenPath(path);
+
+                if (string.IsNullOrWhiteSpace(t.MallId) ||
+                    string.IsNullOrWhiteSpace(t.AccessToken) ||
+                    string.IsNullOrWhiteSpace(t.RefreshToken))
+                    continue;
+
+                var accessExpiry = t.UpdatedAt.AddHours(2);
+                var rtBase = t.RefreshTokenUpdatedAt == default ? t.UpdatedAt : t.RefreshTokenUpdatedAt;
+                var refreshExpiry = rtBase.AddDays(14);
+                var accessRemain = accessExpiry - now;
+                var refreshRemain = refreshExpiry - now;
+                var isSelectedMall = string.Equals(selectedMallId, t.MallId, StringComparison.OrdinalIgnoreCase);
+
+                if (isSelectedMall)
+                {
+                    selectedMallSeen = true;
+                    UpdateAutoRefreshLabel(accessRemain, refreshRemain);
+                }
+
+                if (refreshRemain < refreshWarningRemain)
+                {
+                    refreshWarningRemain = refreshRemain;
+                    refreshWarningMall = t.MallId;
+                }
+
+                if (accessRemain.TotalMinutes >= 5 || refreshRemain.TotalSeconds <= 0)
+                    continue;
+
+                var (clientId, clientSecret) = ResolveClientCredentials(t);
+                if (string.IsNullOrWhiteSpace(clientId) || string.IsNullOrWhiteSpace(clientSecret))
+                {
+                    Log($"[{t.MallId}] Client ID/Secret이 없어 자동갱신을 건너뜁니다.", Color.Orange);
+                    continue;
+                }
+
+                Log($"[{t.MallId}] Access Token 자동갱신 시작...", Color.Cyan);
+                await RefreshAccessToken(t.MallId, clientId, clientSecret, t.RefreshToken, t, updateDisplay: isSelectedMall, showFailureDialog: false);
+                refreshedCount++;
             }
+
+            if (!selectedMallSeen && tokenPaths.Count > 0)
+            {
+                lblAutoRefresh.Text = refreshedCount > 0
+                    ? $"🔄 Cafe24 JSON {refreshedCount}개 자동갱신 완료 — {tokenPaths.Count}개 감시 중"
+                    : $"🔄 Cafe24 JSON {tokenPaths.Count}개 자동갱신 감시 중";
+                lblAutoRefresh.ForeColor = Color.DimGray;
+            }
+
+            if (refreshWarningRemain.TotalDays < 2 && !_reAuthWarningShown)
+            {
+                _reAuthWarningShown = true;
+                var msg = refreshWarningRemain.TotalHours < 1
+                    ? $"⚠ {refreshWarningMall} Refresh Token이 {(int)refreshWarningRemain.TotalMinutes}분 후 만료됩니다!\n즉시 '🔐 재인증'을 눌러주세요."
+                    : $"⚠ {refreshWarningMall} Refresh Token이 {(int)refreshWarningRemain.TotalHours}시간 후 만료됩니다.\n'🔐 재인증' 버튼으로 재인증하세요.";
+                MessageBox.Show(msg, "재인증 필요", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            }
+        }
+
+        private List<string> GetKnownTokenPaths()
+        {
+            var paths = new List<string>();
+            if (!Directory.Exists(KEY_DIR))
+                return paths;
+
+            foreach (var path in Directory.EnumerateFiles(KEY_DIR, "cafe24_token_*.json"))
+            {
+                var fileName = Path.GetFileName(path);
+                if (string.Equals(fileName, "cafe24_token.json", StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                paths.Add(path);
+            }
+
+            return paths;
+        }
+
+        private static string MallIdFromTokenPath(string path)
+        {
+            const string prefix = "cafe24_token_";
+            var name = Path.GetFileNameWithoutExtension(path);
+            return name.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)
+                ? name.Substring(prefix.Length)
+                : "";
+        }
+
+        private (string ClientId, string ClientSecret) ResolveClientCredentials(Cafe24Token token)
+        {
+            var clientId = token.ClientId;
+            var clientSecret = token.ClientSecret;
+            if (!string.IsNullOrWhiteSpace(clientId) && !string.IsNullOrWhiteSpace(clientSecret))
+                return (clientId, clientSecret);
+
+            try
+            {
+                if (File.Exists(SETTINGS_PATH))
+                {
+                    var settings = JsonSerializer.Deserialize<AppSettings>(File.ReadAllText(SETTINGS_PATH));
+                    if (settings?.mall_configs != null && settings.mall_configs.TryGetValue(token.MallId, out var config))
+                    {
+                        if (string.IsNullOrWhiteSpace(clientId))
+                            clientId = config.client_id;
+                        if (string.IsNullOrWhiteSpace(clientSecret))
+                            clientSecret = config.client_secret;
+                    }
+                }
+            }
+            catch
+            {
+            }
+
+            if (string.Equals(txtMallId.Text.Trim(), token.MallId, StringComparison.OrdinalIgnoreCase))
+            {
+                if (string.IsNullOrWhiteSpace(clientId))
+                    clientId = txtClientId.Text.Trim();
+                if (string.IsNullOrWhiteSpace(clientSecret))
+                    clientSecret = txtClientSecret.Text.Trim();
+            }
+
+            return (clientId, clientSecret);
         }
 
         private void UpdateAutoRefreshLabel(TimeSpan accessRemain, TimeSpan refreshRemain)
@@ -1265,7 +1512,7 @@ namespace Cafe24Auth
         protected override void OnFormClosing(FormClosingEventArgs e)
         {
             _cts?.Cancel();
-            _httpListener?.Stop();
+            _tcpListener?.Stop();
             if (_tunnelProcess != null && !_tunnelProcess.HasExited)
                 _tunnelProcess.Kill();
             base.OnFormClosing(e);
